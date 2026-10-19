@@ -22,6 +22,7 @@ use taria_ratatui::{InputStatus, TariaLayer};
 
 use app::{App, ErrorMode};
 use config::{Config, ErrorModeSerde};
+use engine::Language;
 use events::setup_event_channel;
 use persistence::SavedStats;
 use ui::view;
@@ -57,16 +58,52 @@ struct Cli {
     /// With --import: replace existing stats (a .bak backup is written).
     #[arg(long)]
     force: bool,
+
+    /// Practice language: "en" (default) or "tr". Saved to config.toml, so
+    /// later runs keep it. Each language keeps its own stats.
+    #[arg(long, value_name = "CODE", value_parser = parse_language)]
+    language: Option<Language>,
+}
+
+/// Clap parser for `--language`: an unknown code is rejected on the spot,
+/// with the usual clap error, since the user is right there to fix it.
+fn parse_language(code: &str) -> Result<Language, String> {
+    Language::from_code(code).ok_or_else(|| "unknown language (supported: en, tr)".to_string())
+}
+
+/// Resolve the practice language: `--language` wins over the config file
+/// and is written back to it, so `keybr-tui --language tr` once is enough.
+/// An unknown code in the config file is only a warning, so a typo there
+/// never stops the app from starting.
+fn resolve_language(cli: Option<Language>, config: &mut Config) -> Language {
+    if let Some(language) = cli {
+        if config.language != language.code() {
+            config.language = language.code().to_string();
+            if let Err(e) = config.save() {
+                eprintln!("Warning: failed to save language to config: {e}");
+            }
+        }
+        return language;
+    }
+    Language::from_code(&config.language).unwrap_or_else(|| {
+        eprintln!(
+            "Warning: unknown language '{}' in config.toml. Using English.",
+            config.language
+        );
+        Language::English
+    })
 }
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
     let cli = Cli::parse();
+    let mut config = Config::load();
+    let language = resolve_language(cli.language, &mut config);
 
     // --data-dir: print path and exit
     if cli.data_dir {
-        match SavedStats::path() {
+        match SavedStats::path(language) {
             Some(p) => {
                 if let Some(dir) = p.parent() {
                     println!("{}", dir.display());
@@ -79,23 +116,19 @@ fn main() -> color_eyre::Result<()> {
 
     // --import: replay a keybr.com export into stats.json and exit
     if let Some(ref import_path) = cli.import {
-        let config = Config::load();
         let target_wpm = cli.target_wpm.unwrap_or(config.target_wpm);
         let target_cpm = target_wpm as f64 * 5.0;
-        return import::run_import(import_path, target_cpm, cli.force);
+        return import::run_import(import_path, target_cpm, cli.force, language);
     }
 
     // --reset: delete stats file and continue fresh
     if cli.reset {
-        match SavedStats::delete() {
+        match SavedStats::delete(language) {
             Ok(true) => println!("Stats reset. Starting fresh."),
             Ok(false) => println!("No stats file found. Starting fresh."),
             Err(e) => eprintln!("Warning: could not delete stats: {e}"),
         }
     }
-
-    // Load config from disk
-    let config = Config::load();
 
     // Determine settings: CLI args override config file
     let target_wpm = cli.target_wpm.unwrap_or(config.target_wpm);
@@ -113,7 +146,11 @@ fn main() -> color_eyre::Result<()> {
     };
 
     // Load saved stats (unless --reset was used)
-    let saved_stats = if cli.reset { None } else { SavedStats::load() };
+    let saved_stats = if cli.reset {
+        None
+    } else {
+        SavedStats::load(language)
+    };
 
     // Bind the taria layer (agent accessibility) before entering the
     // alternate screen, so its report lands in the primary buffer. Unix
@@ -123,7 +160,7 @@ fn main() -> color_eyre::Result<()> {
 
     let mut terminal = tui::init()?;
 
-    let mut app = App::new_with_state(target_wpm, error_mode, saved_stats);
+    let mut app = App::new_with_language(target_wpm, error_mode, saved_stats, language);
     app.fragment_length = config.fragment_length;
     app.natural_words = config.natural_words;
     app.daily_goal_minutes = config.daily_goal_minutes;
